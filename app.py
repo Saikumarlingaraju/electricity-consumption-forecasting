@@ -109,6 +109,7 @@ mode = st.sidebar.radio(
         "Evaluate on dataset",
         "Browse test samples",
         "Batch predict (upload CSV)",
+        "Forecast next N hours",
     ],
 )
 
@@ -251,6 +252,133 @@ elif mode == "Batch predict (upload CSV)":
 
         except Exception as e:
             st.error(f"Failed to process uploaded file: {e}")
+
+
+elif mode == "Forecast next N hours":
+    st.subheader("Forecast Next N Hours")
+    with st.spinner("Loading data and preparing context..."):
+        df_full = load_data_cached('household_power_consumption.csv')
+
+    # Controls
+    colA, colB, colC = st.columns([1,1,1])
+    with colA:
+        horizon_hours = st.slider("Forecast horizon (hours)", min_value=1, max_value=24, value=6, step=1)
+    with colB:
+        show_agg = st.selectbox("Display granularity", ["Minute", "Hourly avg"], index=1)
+    with colC:
+        use_last_exog = st.checkbox("Hold exogenous features as last observed", value=True)
+
+    # Prepare historical context
+    last_ts = df_full.index.max()
+    start_forecast = last_ts + pd.Timedelta(minutes=1)
+    end_forecast = last_ts + pd.Timedelta(hours=horizon_hours)
+    future_index = pd.date_range(start_forecast, end_forecast, freq='1min')
+
+    # Seed buffers from last history
+    # We'll need last 24h values for lag_24h and last 180 min for rolling features
+    hist_needed_start = last_ts - pd.Timedelta(hours=24)
+    df_hist = df_full.loc[hist_needed_start:last_ts].copy()
+    if len(df_hist) < 180:
+        st.error("Not enough historical data to compute 3h rolling statistics. Please ensure at least 3 hours of data are available.")
+        st.stop()
+
+    # Exogenous features: use last observed values (simple strategy)
+    exog_cols = ['Global_reactive_power', 'Voltage', 'Global_intensity', 'Sub_metering_1', 'Sub_metering_2', 'Sub_metering_3']
+    last_exog = df_full[exog_cols].iloc[-1].to_dict()
+
+    # Rolling buffer of last 180 minutes of target
+    roll_buffer = df_full['Global_active_power'].iloc[-180:].tolist()
+
+    preds = []
+    feature_cols = ['Global_reactive_power', 'Voltage', 'Global_intensity',
+                    'Sub_metering_1', 'Sub_metering_2', 'Sub_metering_3',
+                    'hour', 'day', 'month', 'day_of_week', 'is_weekend',
+                    'lag_1h', 'lag_24h', 'rolling_mean_3h', 'rolling_std_3h']
+
+    # Map of known (actual or predicted) target values for quick lag lookup
+    known_target = df_full['Global_active_power'].to_dict()
+
+    for ts in future_index:
+        # Compute lags based on known/predicted values
+        ts_lag_1h = ts - pd.Timedelta(hours=1)
+        ts_lag_24h = ts - pd.Timedelta(hours=24)
+
+        # lag_1h: prefer predicted when beyond last_ts
+        if ts_lag_1h in known_target:
+            lag1 = known_target[ts_lag_1h]
+        else:
+            # If not found (e.g., first hour), we cannot forecast reliably
+            st.error("Insufficient history to compute lag_1h for the forecast window. Reduce horizon or ensure continuous minute data.")
+            st.stop()
+
+        # lag_24h: should exist in historical window
+        if ts_lag_24h in known_target:
+            lag24 = known_target[ts_lag_24h]
+        else:
+            st.error("Insufficient history to compute lag_24h. Ensure at least 24h of past data.")
+            st.stop()
+
+        # Rolling stats from buffer
+        rolling_mean = float(np.mean(roll_buffer[-180:]))
+        rolling_std = float(np.std(roll_buffer[-180:]) if len(roll_buffer[-180:]) > 1 else 0.0)
+
+        # Calendar features
+        feats = {
+            'hour': ts.hour,
+            'day': ts.day,
+            'month': ts.month,
+            'day_of_week': ts.dayofweek,
+            'is_weekend': int(ts.dayofweek >= 5),
+            'lag_1h': lag1,
+            'lag_24h': lag24,
+            'rolling_mean_3h': rolling_mean,
+            'rolling_std_3h': rolling_std,
+        }
+
+        # Exogenous features
+        if use_last_exog:
+            for c in exog_cols:
+                feats[c] = float(last_exog[c])
+        else:
+            # If not holding last exog, default to last values anyway (could be extended to user inputs)
+            for c in exog_cols:
+                feats[c] = float(last_exog[c])
+
+        # Predict one step
+        X_row = pd.DataFrame([[feats[c] for c in feature_cols]], columns=feature_cols, index=[ts])
+        y_hat = float(model.predict(X_row)[0])
+        preds.append((ts, y_hat))
+
+        # Update buffers
+        known_target[ts] = y_hat
+        roll_buffer.append(y_hat)
+        if len(roll_buffer) > 3600:  # safety cap
+            roll_buffer = roll_buffer[-3600:]
+
+    forecast_df = pd.DataFrame(preds, columns=['timestamp', 'predicted']).set_index('timestamp')
+
+    # Display
+    st.markdown("#### Forecast plot")
+    # Show last 24h actual + forecast
+    hist_plot = df_full[['Global_active_power']].iloc[-1440:].rename(columns={'Global_active_power': 'Actual'})
+    # Combine
+    combined = hist_plot.join(forecast_df.rename(columns={'predicted': 'Predicted'}), how='outer')
+
+    if show_agg == "Hourly avg":
+        combined_disp = combined.resample('H').mean()
+    else:
+        combined_disp = combined
+
+    st.line_chart(combined_disp)
+
+    st.markdown("#### Forecast table (head)")
+    st.dataframe(forecast_df.head(20))
+
+    # Download
+    out_buf = StringIO()
+    out_csv = forecast_df.reset_index().rename(columns={'index': 'timestamp'})
+    out_csv.to_csv(out_buf, index=False)
+    st.download_button("Download forecast CSV", out_buf.getvalue(), file_name="forecast.csv", mime="text/csv")
 
 
 st.divider()
